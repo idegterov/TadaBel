@@ -1,4 +1,7 @@
 import os
+# Включаем hf_transfer для максимально быстрой загрузки датасетов
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
 import torch
 import torchaudio
 import argparse
@@ -46,23 +49,29 @@ def parse_args():
     parser.add_argument("--subset", action="store_true", help="Use a 5% subset for a quick sanity check")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=4, help="Per device batch size")
+    parser.add_argument("--hf_token", type=str, default=None, help="HuggingFace token for downloading and pushing")
     return parser.parse_args()
 
 def main():
     args = parse_args()
     
     # 1. Configuration
-    # ИСПОЛЬЗУЕМ БЕЛОРУССКУЮ МОДЕЛЬ КАК БАЗУ!
     base_model_name = "ales/wav2vec2-cv-be" 
     tokenizer_name = "meta-llama/Llama-3.2-1B"
     output_dir = "./tada-aligner-be"
     
+    # Optional login to Hugging Face
+    if args.hf_token:
+        from huggingface_hub import login
+        print("Logging into Hugging Face Hub...")
+        login(token=args.hf_token)
+    
     print("Loading tokenizer and feature extractor...")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, token=args.hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(base_model_name)
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(base_model_name, token=args.hf_token)
 
     print("Initializing Aligner and injecting pre-trained Belarusian weights...")
     config = AlignerConfig(
@@ -71,26 +80,31 @@ def main():
     )
     aligner = Aligner(config)
     
-    # Загружаем предобученные веса, игнорируя размер головы (буквы заменятся на токены Llama)
+    # Загружаем предобученные веса, игнорируя размер головы
     pretrained_encoder = AutoModelForCTC.from_pretrained(
         base_model_name, 
         ignore_mismatched_sizes=True, 
-        vocab_size=len(tokenizer)
+        vocab_size=len(tokenizer),
+        token=args.hf_token
     )
     
-    # Переносим веса в наш энкодер
     aligner.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
-    model = aligner.encoder # Это то, что мы будем тренировать
+    model = aligner.encoder 
 
     # 2. Data Preparation
     print("Loading datasets/fosters/be-bel-audio-corpus...")
-    # Датасет весит 21ГБ, загрузка займет время
-    dataset = load_dataset("fosters/be-bel-audio-corpus", split="train")
-
+    
+    # Чтобы не качать 21 ГБ, если запрошен subset, мы просим у HF только первые 5%
+    split_name = "train[:5%]" if args.subset else "train"
     if args.subset:
-        print("Subset flag detected! Using 5% of the data for sanity check...")
-        subset_size = int(len(dataset) * 0.05)
-        dataset = dataset.select(range(subset_size))
+        print(f"Subset flag detected! Downloading ONLY 5% of the data using split '{split_name}'...")
+        
+    dataset = load_dataset(
+        "fosters/be-bel-audio-corpus", 
+        split=split_name, 
+        token=args.hf_token,
+        # num_proc=4 # Раскомментируйте, если загрузка зависает
+    )
 
     # Сплит на train и eval (90/10)
     dataset = dataset.train_test_split(test_size=0.1, seed=42)
@@ -100,7 +114,7 @@ def main():
     def prepare_dataset(batch):
         audio = batch["audio"]
         
-        # Resample if not 16kHz (Wav2Vec2 requires 16000)
+        # Resample if not 16kHz
         if audio["sampling_rate"] != 16000:
             import torchaudio.functional as F
             waveform = torch.tensor(audio["array"]).float().unsqueeze(0)
@@ -109,14 +123,11 @@ def main():
         else:
             audio_array = audio["array"]
             
-        # Extract features
         batch["input_values"] = feature_extractor(audio_array, sampling_rate=16000).input_values[0]
-        # Tokenize text using Llama Tokenizer (TADA requirement)
         batch["labels"] = tokenizer(batch["sentence"], add_special_tokens=False).input_ids
         return batch
 
     print("Processing and resampling audio (this may take a while)...")
-    # Используем num_proc для многопоточной обработки аудио
     train_dataset = train_dataset.map(prepare_dataset, remove_columns=train_dataset.column_names, num_proc=4)
     eval_dataset = eval_dataset.map(prepare_dataset, remove_columns=eval_dataset.column_names, num_proc=4)
     
@@ -130,18 +141,19 @@ def main():
         output_dir=output_dir,
         group_by_length=True,
         per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=8 // args.batch_size, # Целевой эффективный батч = 8
+        gradient_accumulation_steps=8 // args.batch_size, 
         evaluation_strategy="steps",
         num_train_epochs=args.epochs,
         fp16=torch.cuda.is_available(),
         save_steps=500,
         eval_steps=500,
         logging_steps=50,
-        learning_rate=1e-4, # Чуть меньше для fine-tuning
+        learning_rate=1e-4, 
         warmup_steps=500,
         save_total_limit=2,
         dataloader_num_workers=4,
-        report_to="tensorboard"
+        report_to="tensorboard",
+        # hub_token=args.hf_token # Если захотите потом пушить модель напрямую через Trainer
     )
 
     # 4. Initialize Trainer
