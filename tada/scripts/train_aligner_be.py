@@ -1,5 +1,5 @@
 import os
-# Включаем hf_transfer для максимально быстрой загрузки датасетов
+# Enable hf_transfer for the fastest possible dataset downloading
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 import torch
@@ -56,6 +56,7 @@ def main():
     args = parse_args()
     
     # 1. Configuration
+    # USE THE BELARUSIAN MODEL AS A BASE!
     base_model_name = "ales/wav2vec2-cv-be" 
     tokenizer_name = "meta-llama/Llama-3.2-1B"
     output_dir = "./tada-aligner-be"
@@ -80,7 +81,7 @@ def main():
     )
     aligner = Aligner(config)
     
-    # Загружаем предобученные веса, игнорируя размер головы
+    # Load pre-trained weights, ignoring the head size mismatch
     pretrained_encoder = AutoModelForCTC.from_pretrained(
         base_model_name, 
         ignore_mismatched_sizes=True, 
@@ -88,13 +89,14 @@ def main():
         token=args.hf_token
     )
     
+    # Transfer the weights to our encoder
     aligner.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
     model = aligner.encoder 
 
     # 2. Data Preparation
     print("Loading datasets/fosters/be-bel-audio-corpus...")
     
-    # Чтобы не качать 21 ГБ, если запрошен subset, мы просим у HF только первые 5%
+    # To avoid downloading 21GB when a subset is requested, we ask HF for only the first 5%
     split_name = "train[:5%]" if args.subset else "train"
     if args.subset:
         print(f"Subset flag detected! Downloading ONLY 5% of the data using split '{split_name}'...")
@@ -103,10 +105,10 @@ def main():
         "fosters/be-bel-audio-corpus", 
         split=split_name, 
         token=args.hf_token,
-        # num_proc=4 # Раскомментируйте, если загрузка зависает
+        # num_proc=4 # Uncomment if the download hangs
     )
 
-    # Сплит на train и eval (90/10)
+    # Split into train and eval (90/10)
     dataset = dataset.train_test_split(test_size=0.1, seed=42)
     train_dataset = dataset["train"]
     eval_dataset = dataset["test"]
@@ -141,7 +143,7 @@ def main():
         output_dir=output_dir,
         group_by_length=True,
         per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=8 // args.batch_size, 
+        gradient_accumulation_steps=8 // args.batch_size, # Target effective batch size = 8
         evaluation_strategy="steps",
         num_train_epochs=args.epochs,
         fp16=torch.cuda.is_available(),
@@ -153,7 +155,7 @@ def main():
         save_total_limit=2,
         dataloader_num_workers=4,
         report_to="tensorboard",
-        # hub_token=args.hf_token # Если захотите потом пушить модель напрямую через Trainer
+        # hub_token=args.hf_token # If you want to push the model directly via Trainer later
     )
 
     # 4. Initialize Trainer
